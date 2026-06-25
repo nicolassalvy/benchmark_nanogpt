@@ -57,7 +57,10 @@ class Solver(BaseSolver):
         return stop_val + 250
 
     def warm_up(self):
+        n_iter = self.num_steps
+        self.num_steps = 10
         self.run_once(stop_val=10)
+        self.num_steps = n_iter
 
     def run(self, cb):
         # Weight-decay the 2D weights (body + embedding/head); not 1D params.
