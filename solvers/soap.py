@@ -8,7 +8,10 @@ import torch
 
 from benchmark_utils.optimizers.soap import SOAP
 from benchmark_utils.lr_scheduler import get_lr
-from benchmark_utils.distributed_tools import setup_distributed
+from benchmark_utils.torch_utils import compile_step
+from benchmark_utils.distributed_tools import (
+    setup_distributed, broadcast_model
+)
 
 
 class Solver(BaseSolver):
@@ -19,7 +22,7 @@ class Solver(BaseSolver):
         "weight_decay": [1e-4],
         "num_steps": [6200],
         "batch_size": [64],
-        "slurm_nodes": [1, 2],
+        "slurm_nodes": [2],
     }
     slurm_params = {
         "slurm_gres": "gpu:4",
@@ -35,6 +38,7 @@ class Solver(BaseSolver):
         model = model.to(device=device)
         model.device = device
         self.train_dataloader = train_dataloader
+        self.train_loss = None
 
         self.ctx = (
             torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -43,7 +47,7 @@ class Solver(BaseSolver):
         )
 
         self.model = torch.compile(model, dynamic=False, fullgraph=True)
-        SOAP.step = torch.compile(torch.no_grad(SOAP.step))
+        compile_step(SOAP)
 
     def __del__(self):
         if getattr(self, "dist", None) is not None:
@@ -56,14 +60,12 @@ class Solver(BaseSolver):
         self.run_once(stop_val=10)
 
     def run(self, cb):
-        param_dict = {
-            pn: p for pn, p in self.model.named_parameters() if p.requires_grad
-        }
-        decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for _, p in param_dict.items() if p.dim() < 2]
+        # Weight-decay the 2D weights (body + embedding/head); not 1D params.
+        groups = self.model.optim_param_groups()
         optim_groups = [
-            {"params": decay_params, "weight_decay": self.weight_decay},
-            {"params": nodecay_params, "weight_decay": 0.0},
+            {"params": groups["matrix"] + groups["embed_head"],
+             "weight_decay": self.weight_decay},
+            {"params": groups["scalar"], "weight_decay": 0.0},
         ]
 
         self.optimizer = SOAP(
@@ -78,8 +80,7 @@ class Solver(BaseSolver):
             rank=self.rank,
         )
 
-        if self.dist is not None:
-            self.dist.barrier()
+        broadcast_model(self.dist, self.model)
 
         step = 0
         with tqdm(total=self.num_steps, desc="Training") as progress:
@@ -96,6 +97,14 @@ class Solver(BaseSolver):
                 with self.ctx:
                     loss, *_ = self.model(*data)
                 loss.backward()
+
+                # Track a smoothed train loss (on-device, no per-step sync).
+                ema = loss.detach()
+                self.train_loss = (
+                    ema if self.train_loss is None
+                    else 0.9 * self.train_loss + 0.1 * ema
+                )
+
                 if self.dist is not None:
                     for param in self.model.parameters():
                         self.dist.all_reduce(
@@ -113,4 +122,7 @@ class Solver(BaseSolver):
     def get_result(self):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        return dict(model=self.model, dist=self.dist)
+        train_loss = (
+            float(self.train_loss) if self.train_loss is not None else None
+        )
+        return dict(model=self.model, dist=self.dist, train_loss=train_loss)

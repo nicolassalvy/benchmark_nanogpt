@@ -7,7 +7,10 @@ from tqdm.auto import tqdm
 
 from benchmark_utils.lr_scheduler import get_lr
 from benchmark_utils.optimizers.scion_light import ScionLight
-from benchmark_utils.distributed_tools import setup_distributed
+from benchmark_utils.torch_utils import compile_step
+from benchmark_utils.distributed_tools import (
+    setup_distributed, broadcast_model
+)
 
 
 # The benchmark solvers must be named `Solver` and
@@ -24,13 +27,9 @@ class Solver(BaseSolver):
         "momentum": [0.1],
         "hidden_radius": [50.0],
         "lm_head_radius": [3000.0],
-        "num_steps": [6200],
+        "num_steps": [5100],
         "batch_size": [64],
-        "slurm_nodes": [1, 2],
-    }
-    slurm_params = {
-        "slurm_gres": "gpu:4",
-        "slurm_ntasks_per_node": 4,
+        "slurm_nodes": [2],
     }
 
     # List of packages needed to run the solver.
@@ -46,6 +45,7 @@ class Solver(BaseSolver):
         model = model.to(device=device)
         model.device = device  # store the device in the model
         self.train_dataloader = train_dataloader
+        self.train_loss = None
 
         # use mixed precision if cuda is available
         self.ctx = (
@@ -55,7 +55,7 @@ class Solver(BaseSolver):
 
         # Torch compile the model and the optimizer step function
         self.model = torch.compile(model, dynamic=False, fullgraph=True)
-        ScionLight.step = torch.compile(torch.no_grad(ScionLight.step))
+        compile_step(ScionLight)
 
     def __del__(self):
         # Clean up communication resources
@@ -72,27 +72,18 @@ class Solver(BaseSolver):
         self.num_steps = n_iter
 
     def run(self, cb):
-        # Configure the optimizer with different groups for transformer and
-        # lm_head (Spectral norm for transformer, Sign for lm_head)
-        transformer_params = []
-        lm_head_params = []
-
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and param.dim() >= 2:
-                if "lm_head" in name:
-                    lm_head_params.append(param)
-                else:
-                    transformer_params.append(param)
-
+        # Spectral norm on the 2D body matrices; Sign norm on the
+        # embedding/head (1D params, if any, ride with the head group).
+        groups = self.model.optim_param_groups()
         optim_groups = [
             {
-                "params": transformer_params,
+                "params": groups["matrix"],
                 "norm": "Spectral",
                 "norm_kwargs": {},
                 "scale": self.hidden_radius,
             },
             {
-                "params": lm_head_params,
+                "params": groups["embed_head"] + groups["scalar"],
                 "norm": "Sign",
                 "norm_kwargs": {},
                 "scale": self.lm_head_radius,
@@ -112,8 +103,7 @@ class Solver(BaseSolver):
             rank=self.rank,
         )
 
-        if self.dist is not None:
-            self.dist.barrier()  # wait for all processes to be ready
+        broadcast_model(self.dist, self.model)
 
         step = 0
         with tqdm(total=self.num_steps, desc="Training") as progress:
@@ -134,14 +124,22 @@ class Solver(BaseSolver):
                     loss, *_ = self.model(*data)
                 loss.backward()
 
+                # Track a smoothed train loss (on-device, no per-step sync).
+                ema = loss.detach()
+                self.train_loss = (
+                    ema if self.train_loss is None
+                    else 0.9 * self.train_loss + 0.1 * ema
+                )
+
                 if self.dist is not None:
                     for param in self.model.parameters():
                         self.dist.all_reduce(
                             param.grad, op=self.dist.ReduceOp.AVG
                         )
 
-                # determine and set the learning rate for this iteration
-                scale_lr = get_lr(step, self.num_steps)
+                # determine and set the learning rate for this iteration.
+                # cooldown over last ~28% (1450/5100, Scion reference).
+                scale_lr = get_lr(step, self.num_steps, cooldown_frac=0.28)
                 for param_group in self.optimizer.param_groups:
                     param_group["lr"] = torch.tensor(
                         self.learning_rate * scale_lr
@@ -155,4 +153,7 @@ class Solver(BaseSolver):
     def get_result(self):
         if torch.cuda.is_available():
             torch.cuda.synchronize()  # wait for all operations to finish
-        return dict(model=self.model, dist=self.dist)
+        train_loss = (
+            float(self.train_loss) if self.train_loss is not None else None
+        )
+        return dict(model=self.model, dist=self.dist, train_loss=train_loss)

@@ -6,25 +6,32 @@ import torch
 from torch.optim import AdamW
 from tqdm.auto import tqdm
 
-from benchmark_utils.lr_scheduler import get_lr
-from benchmark_utils.distributed_tools import setup_distributed
+from benchmark_utils.lr_scheduler import get_lr_trapezoidal
+from benchmark_utils.torch_utils import compile_step
+from benchmark_utils.distributed_tools import (
+    setup_distributed, broadcast_model
+)
 
 
 class Solver(BaseSolver):
 
     name = 'Adam'
 
+    # Defaults follow modded-nanogpt commit
+    # 844e5fdb2334ff83324e6f1f900ce443dd9e1226 (run.sh):
+    # lr=0.0018, betas=(0.9, 0.98), wd=0 (the reference's custom Adam
+    # ignores weight decay), 9536 iterations with 256 warmup / 2048 warmdown,
+    # batch_size=64,
+    # sequence_length=1024 over 8 GPUs (=> global batch = 512).
     parameters = {
-        'learning_rate': [1e-3],
-        'weight_decay': [1e-4],
-        'num_steps': [6200],
+        'learning_rate': [1.8e-3],
+        'weight_decay': [0.0],
+        'num_steps': [9536],
         'batch_size': [64],
-        "slurm_nodes": [1, 2],
-        "sin_init": [True],
-    }
-    slurm_params = {
-        "slurm_gres": "gpu:4",
-        "slurm_ntasks_per_node": 4,
+        'warmup_iters': [256],
+        'warmdown_iters': [2048],
+        "slurm_nodes": [2],
+        "sin_init": [False],
     }
 
     sampling_strategy = 'callback'
@@ -43,6 +50,7 @@ class Solver(BaseSolver):
         model = model.to(device=device)
         model.device = device  # store the device in the model
         self.train_dataloader = train_dataloader
+        self.train_loss = None
 
         # use mixed precision if cuda is available
         self.ctx = (
@@ -52,7 +60,7 @@ class Solver(BaseSolver):
 
         # Torch compile the model and the optimizer step function
         self.model = torch.compile(model, dynamic=False, fullgraph=True)
-        AdamW.step = torch.compile(torch.no_grad(AdamW.step))
+        compile_step(AdamW)
 
     def __del__(self):
         # Clean up communication resources
@@ -67,29 +75,20 @@ class Solver(BaseSolver):
 
     def run(self, cb):
 
-        # configure the optimizer
-        # List all parameters that require gradients
-        param_dict = {
-            pn: p for pn, p in self.model.named_parameters()
-            if p.requires_grad
-        }
-
-        # create optim groups. Any parameters that is 2D will be weight
-        # decayed, otherwise no. i.e. all weight tensors in
-        # matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        # Weight-decay the 2D body matrices; not the embedding/head or 1D
+        # params (decaying the tied embedding hurts the final loss).
+        groups = self.model.optim_param_groups()
         optim_groups = [
-            {'params': decay_params, 'weight_decay': self.weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+            {'params': groups["matrix"], 'weight_decay': self.weight_decay},
+            {'params': groups["embed_head"] + groups["scalar"],
+             'weight_decay': 0.0},
         ]
 
-        # Create AdamW optimizer
-        # TODO: consider using a ZeroRedundancyOptimizer
+        # Create AdamW optimizer. Betas (0.9, 0.98) match the reference.
         self.optimizer = AdamW(
             optim_groups,
             lr=torch.tensor(self.learning_rate),
-            betas=(0.9, 0.95),
+            betas=(0.9, 0.98),
             fused=True
         )
 
@@ -99,8 +98,7 @@ class Solver(BaseSolver):
             rank=self.rank,
         )
 
-        if self.dist is not None:
-            self.dist.barrier()  # wait for all processes to be ready
+        broadcast_model(self.dist, self.model)
 
         step = 0
         with tqdm(total=self.num_steps, desc="Training") as progress:
@@ -116,6 +114,14 @@ class Solver(BaseSolver):
                 with self.ctx:
                     loss, *_ = self.model(*data)
                 loss.backward()
+
+                # Track a smoothed train loss (on-device, no per-step sync).
+                ema = loss.detach()
+                self.train_loss = (
+                    ema if self.train_loss is None
+                    else 0.9 * self.train_loss + 0.1 * ema
+                )
+
                 if self.dist is not None:
                     for param in self.model.parameters():
                         self.dist.all_reduce(
@@ -123,7 +129,11 @@ class Solver(BaseSolver):
                         )
 
                 # determine and set the learning rate for this iteration
-                scale_lr = get_lr(step, self.num_steps)
+                scale_lr = get_lr_trapezoidal(
+                    step, self.num_steps,
+                    warmup_iters=self.warmup_iters,
+                    warmdown_iters=self.warmdown_iters,
+                )
                 for param_group in self.optimizer.param_groups:
                     param_group['lr'] = torch.tensor(
                         self.learning_rate * scale_lr
@@ -134,4 +144,7 @@ class Solver(BaseSolver):
     def get_result(self):
         if torch.cuda.is_available():
             torch.cuda.synchronize()  # wait for all operations to finish
-        return dict(model=self.model, dist=self.dist)
+        train_loss = (
+            float(self.train_loss) if self.train_loss is not None else None
+        )
+        return dict(model=self.model, dist=self.dist, train_loss=train_loss)

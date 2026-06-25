@@ -1,9 +1,12 @@
 from contextlib import nullcontext
 
 import torch
-from benchmark_utils.distributed_tools import setup_distributed
+from benchmark_utils.distributed_tools import (
+    setup_distributed, broadcast_model
+)
 from benchmark_utils.lr_scheduler import get_lr
 from benchmark_utils.optimizers.muon import Muon
+from benchmark_utils.torch_utils import compile_step
 from benchopt import BaseSolver
 from torch.optim import AdamW
 from tqdm.auto import tqdm
@@ -12,18 +15,17 @@ from tqdm.auto import tqdm
 class Solver(BaseSolver):
     name = "Muon"
 
+    # Defaults match modded-nanogpt 844e5fd: Muon on the transformer blocks
+    # at 0.1x the base lr, AdamW on the (tied) lm_head/embedding at the base
+    # lr, momentum 0.95, no weight decay, 6200 steps over a global batch of
+    # 8*64=512 sequences.
     parameters = {
-        "muon_lr": [0.02],
+        "muon_lr": [3.6e-4],
         "muon_momentum": [0.95],
-        "adam_lr": [3e-4],
-        "adam_weight_decay": [0.0],
+        "adam_lr": [3.6e-3],
         "num_steps": [6200],
         "batch_size": [64],
-        "slurm_nodes": [1, 2],
-    }
-    slurm_params = {
-        "slurm_gres": "gpu:4",
-        "slurm_ntasks_per_node": 4,
+        "slurm_nodes": [2],
     }
 
     sampling_strategy = "callback"
@@ -34,6 +36,7 @@ class Solver(BaseSolver):
         model = model.to(device=device)
         model.device = device
         self.train_dataloader = train_dataloader
+        self.train_loss = None
 
         self.ctx = (
             torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -42,8 +45,8 @@ class Solver(BaseSolver):
         )
 
         self.model = torch.compile(model, dynamic=False, fullgraph=True)
-        Muon.step = torch.compile(torch.no_grad(Muon.step))
-        AdamW.step = torch.compile(torch.no_grad(AdamW.step))
+        compile_step(Muon)
+        compile_step(AdamW)
 
     def __del__(self):
         if getattr(self, "dist", None) is not None:
@@ -59,45 +62,23 @@ class Solver(BaseSolver):
         self.num_steps = n_iter
 
     def run(self, cb):
-        # Split parameters into Muon group (internal 2D matrices) and
-        # AdamW group (embeddings, lm_head, biases, layernorms).
-        muon_params = []
-        adam_decay_params = []
-        adam_nodecay_params = []
-
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-            # Embeddings and lm_head go to AdamW, everything else 2D goes
-            # to Muon.
-            if (
-                param.dim() >= 2
-                and "wte" not in name
-                and "wpe" not in name
-                and "lm_head" not in name
-            ):
-                muon_params.append(param)
-            elif param.dim() >= 2:
-                adam_decay_params.append(param)
-            else:
-                adam_nodecay_params.append(param)
+        # Muon on the 2D body matrices; AdamW on the embedding/head and any
+        # 1D params.
+        groups = self.model.optim_param_groups()
 
         self.muon_optimizer = Muon(
-            muon_params,
+            groups["matrix"],
             lr=torch.tensor(self.muon_lr),
             momentum=self.muon_momentum,
         )
 
+        # Embedding/head and 1D params are never weight-decayed (modded uses
+        # wd=0 on lm_head); Muon already handles the matrices.
         self.adam_optimizer = AdamW(
-            [
-                {
-                    "params": adam_decay_params,
-                    "weight_decay": self.adam_weight_decay
-                },
-                {"params": adam_nodecay_params, "weight_decay": 0.0},
-            ],
+            groups["embed_head"] + groups["scalar"],
             lr=torch.tensor(self.adam_lr),
             betas=(0.9, 0.95),
+            weight_decay=0.0,
             fused=True,
         )
 
@@ -107,8 +88,7 @@ class Solver(BaseSolver):
             rank=self.rank,
         )
 
-        if self.dist is not None:
-            self.dist.barrier()
+        broadcast_model(self.dist, self.model)
 
         step = 0
         with tqdm(total=self.num_steps, desc="Training") as progress:
@@ -127,14 +107,24 @@ class Solver(BaseSolver):
                     loss, *_ = self.model(*data)
                 loss.backward()
 
+                # Track a smoothed train loss (on-device, no per-step sync).
+                ema = loss.detach()
+                self.train_loss = (
+                    ema if self.train_loss is None
+                    else 0.9 * self.train_loss + 0.1 * ema
+                )
+
                 if self.dist is not None:
                     for param in self.model.parameters():
                         self.dist.all_reduce(
                             param.grad, op=self.dist.ReduceOp.AVG
                         )
 
-                # Scale learning rates with the schedule
-                scale_lr = get_lr(step, self.num_steps)
+                # Scale learning rates with the schedule. cooldown over the
+                # last 29% of training (~1800 steps at num_steps=6200, matching
+                # modded-nanogpt's warmdown), kept as a fraction so it scales
+                # with num_steps.
+                scale_lr = get_lr(step, self.num_steps, cooldown_frac=0.29)
                 for param_group in self.muon_optimizer.param_groups:
                     param_group["lr"] = torch.tensor(self.muon_lr * scale_lr)
                 for param_group in self.adam_optimizer.param_groups:
@@ -146,4 +136,7 @@ class Solver(BaseSolver):
     def get_result(self):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        return dict(model=self.model, dist=self.dist)
+        train_loss = (
+            float(self.train_loss) if self.train_loss is not None else None
+        )
+        return dict(model=self.model, dist=self.dist, train_loss=train_loss)
