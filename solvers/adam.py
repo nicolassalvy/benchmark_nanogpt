@@ -26,10 +26,10 @@ class Solver(BaseSolver):
     parameters = {
         'learning_rate': [1.8e-3],
         'weight_decay': [0.1],
-        'num_steps': [9536],
+        'num_steps': [8600],
         'batch_size': [64],
         'warmup_iters': [256],
-        'warmdown_iters': [4768],  # 50%
+        'warmdown_iters': [4300],  # 50%
         "slurm_nodes": [2],
         "sin_init": [False],
     }
